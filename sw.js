@@ -1,5 +1,5 @@
-/* 随手记 Lite — Service Worker：缓存全部静态资源，断网完全可用 */
-const CACHE = 'suishouji-lite-v1';
+/* Summa — Service Worker：缓存全部静态资源，断网完全可用 */
+const CACHE = 'summa-v1';
 const ASSETS = [
   './',
   './index.html',

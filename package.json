@@ -1,8 +1,8 @@
 {
-  "name": "suishouji-lite",
+  "name": "summa",
   "version": "0.1.0",
   "private": true,
-  "description": "随手记 Lite — 轻量隐私优先的 PWA 记账应用（单 HTML 文件，无构建链）",
+  "description": "Summa — 轻量隐私优先的 PWA 记账应用（单 HTML 文件，无构建链）",
   "type": "module",
   "scripts": {
     "dev": "node server.mjs",

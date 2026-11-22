@@ -1,4 +1,4 @@
-// 随手记 Lite — 零依赖静态服务器（npm run dev 用，支持 --host/--port/--strictPort）
+// Summa — 零依赖静态服务器（npm run dev 用，支持 --host/--port/--strictPort）
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -60,5 +60,5 @@ server.on('error', err => {
 
 server.listen(PORT, HOST, () => {
   const addr = server.address();
-  console.log(`随手记 Lite dev server: http://${HOST}:${addr.port}/`);
+  console.log(`Summa dev server: http://${HOST}:${addr.port}/`);
 });

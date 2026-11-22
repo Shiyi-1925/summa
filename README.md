@@ -1,4 +1,4 @@
-# 随手记 Lite（summa）
+# Summa
 
 单文件、零依赖的 PWA 记账应用。原生 HTML/CSS/JS，数据全部存在本地 IndexedDB，离线可用，可安装到手机主屏幕。
 

@@ -6,9 +6,9 @@
 <meta name="theme-color" content="#12a382">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="随手记 Lite">
+<meta name="apple-mobile-web-app-title" content="Summa">
 <meta name="mobile-web-app-capable" content="yes">
-<title>随手记 Lite</title>
+<title>Summa</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="icon" href="icons/favicon-64.png">
@@ -286,7 +286,7 @@
 <script>
 'use strict';
 /* ================= IndexedDB 轻量封装 ================= */
-const DB_NAME = 'suishouji-lite', DB_VER = 1;
+const DB_NAME = 'summa', DB_VER = 1, LEGACY_DB = 'suishouji-lite';
 let dbp = null;
 function openDB() {
   if (dbp) return dbp;
@@ -305,11 +305,54 @@ function openDB() {
         st.createIndex('byDate', 'date');
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = async () => {
+      try { await migrateLegacy(req.result); } catch (e) { console.warn('legacy migrate failed', e); }
+      resolve(req.result);
+    };
     req.onerror = () => reject(req.error);
   });
   return dbp;
 }
+
+/* 旧库名一次性迁移：把 suishouji-lite 的数据原样搬进 summa，搬完删除旧库 */
+async function migrateLegacy(db) {
+  const legacy = await new Promise(res => {
+    const rq = indexedDB.open(LEGACY_DB);
+    rq.onupgradeneeded = e => e.target.transaction.abort(); // 旧库不存在则放弃
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => res(null);
+  });
+  if (!legacy) return;
+  try {
+    for (const name of ['ledgers', 'categories', 'transactions']) {
+      const rows = await new Promise((res, rej) => {
+        const rq = legacy.transaction(name, 'readonly').objectStore(name).getAll();
+        rq.onsuccess = () => res(rq.result || []);
+        rq.onerror = () => rej(rq.error);
+      });
+      if (!rows.length) continue;
+      const exist = await new Promise((res, rej) => {
+        const rq = db.transaction(name, 'readonly').objectStore(name).getAll();
+        rq.onsuccess = () => res(rq.result || []);
+        rq.onerror = () => rej(rq.error);
+      });
+      if (exist.length) continue; // 新库已有数据，绝不覆盖
+      await new Promise((res, rej) => {
+        const tx = db.transaction(name, 'readwrite');
+        rows.forEach(r => tx.objectStore(name).put(r));
+        tx.oncomplete = res;
+        tx.onerror = () => rej(tx.error);
+      });
+    }
+  } finally {
+    legacy.close();
+  }
+  await new Promise(res => {
+    const rq = indexedDB.deleteDatabase(LEGACY_DB);
+    rq.onsuccess = rq.onerror = rq.onblocked = () => res();
+  });
+}
+
 async function store(name, mode) {
   const db = await openDB();
   return db.transaction(name, mode || 'readonly').objectStore(name);
@@ -735,7 +778,7 @@ function renderSettings(main) {
       <div class="set-row"><span>数据情况<span class="sub" id="dataInfo">统计中…</span></span></div>
       <div class="set-row"><span>清空全部数据<span class="sub">删除本机所有流水、分类（不可恢复）</span></span><button class="danger" id="btnWipe">清空</button></div>
     </div>
-    <p style="text-align:center;color:var(--text-3);font-size:12px;margin-top:8px">随手记 Lite · 数据只存在这台设备上</p>
+    <p style="text-align:center;color:var(--text-3);font-size:12px;margin-top:8px">Summa · 数据只存在这台设备上</p>
   `);
   $('#btnExport').onclick = exportCSV;
   $('#btnWipe').onclick = wipeAll;
@@ -755,10 +798,10 @@ async function exportCSV() {
   });
   const csv = '﻿' + head + '\n' + rows.join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const fname = `随手记Lite_备份_${fmtDate(new Date())}.csv`;
+  const fname = `Summa_备份_${fmtDate(new Date())}.csv`;
   const file = new File([blob], fname, { type: 'text/csv;charset=utf-8' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: '随手记 Lite 备份' }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    try { await navigator.share({ files: [file], title: 'Summa 备份' }); return; } catch (e) { if (e.name === 'AbortError') return; }
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = fname; a.click();
