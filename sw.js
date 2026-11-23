@@ -1,5 +1,5 @@
 /* Summa — Service Worker：缓存全部静态资源，断网完全可用 */
-const CACHE = 'summa-v1';
+const CACHE = 'summa-v2';
 const ASSETS = [
   './',
   './index.html',
