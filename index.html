@@ -204,6 +204,8 @@
   .set-row .sub { display: block; font-size: 12px; color: var(--text-3); margin-top: 3px; }
   .set-row button { background: var(--brand-soft); color: var(--brand-dark); font-weight: 600; font-size: 14px; padding: 8px 15px; border-radius: 10px; }
   .set-row button.danger { background: #fdeeee; color: var(--danger); }
+  #importHistoryWrap .set-row > span:first-child { min-width: 0; }
+  #importHistoryWrap .sub { word-break: break-all; white-space: normal; }
   .install-tip {
     background: #fff8e6; border: 1px solid #f5e3b3; color: #8a6d1d;
     border-radius: var(--radius); padding: 12px 14px; font-size: 13px; line-height: 1.7; margin-bottom: 12px;
@@ -286,7 +288,7 @@
 <script>
 'use strict';
 /* ================= IndexedDB 轻量封装 ================= */
-const DB_NAME = 'summa', DB_VER = 1, LEGACY_DB = 'suishouji-lite';
+const DB_NAME = 'summa', DB_VER = 2, LEGACY_DB = 'suishouji-lite';
 let dbp = null;
 function openDB() {
   if (dbp) return dbp;
@@ -303,6 +305,9 @@ function openDB() {
       if (!db.objectStoreNames.contains('transactions')) {
         const st = db.createObjectStore('transactions', { keyPath: 'id', autoIncrement: true });
         st.createIndex('byDate', 'date');
+      }
+      if (!db.objectStoreNames.contains('imports')) {
+        db.createObjectStore('imports', { keyPath: 'id', autoIncrement: true });
       }
     };
     req.onsuccess = async () => {
@@ -774,14 +779,24 @@ function renderSettings(main) {
       Safari 打开本页 → 点底部「分享」→「添加到主屏幕」。装好后从图标启动，全屏无地址栏，数据独立保存，不受 Safari 7 天清理影响。
     </div>
     <div class="card" style="margin-bottom:12px">
+      <div class="set-row"><span>导入 CSV<span class="sub">支持 Summa 备份、Timi 记账导出；自动识别格式、自动建分类、按 日期+类型+分类+金额+备注 去重</span></span><button id="btnImport">导入</button></div>
       <div class="set-row"><span>导出 CSV 备份<span class="sub">生成文件并调起分享面板，可存「文件」App</span></span><button id="btnExport">导出</button></div>
       <div class="set-row"><span>数据情况<span class="sub" id="dataInfo">统计中…</span></span></div>
       <div class="set-row"><span>清空全部数据<span class="sub">删除本机所有流水、分类（不可恢复）</span></span><button class="danger" id="btnWipe">清空</button></div>
     </div>
+    <div id="importHistoryWrap"></div>
+    <input type="file" id="importFile" accept=".csv" style="display:none">
     <p style="text-align:center;color:var(--text-3);font-size:12px;margin-top:8px">Summa · 数据只存在这台设备上</p>
   `);
   $('#btnExport').onclick = exportCSV;
   $('#btnWipe').onclick = wipeAll;
+  $('#btnImport').onclick = () => $('#importFile').click();
+  $('#importFile').onchange = e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (f) runImport(f);
+  };
+  renderImportHistory();
   getAll('transactions').then(txs => {
     const el = $('#dataInfo');
     if (el) el.textContent = `共 ${txs.length} 条流水 · ${new Date().toLocaleDateString('zh-CN')} 统计`;
@@ -814,8 +829,213 @@ async function wipeAll() {
   const db = await openDB();
   await new Promise(res => { const t = db.transaction('transactions', 'readwrite'); t.objectStore('transactions').clear(); t.oncomplete = res; });
   await new Promise(res => { const t = db.transaction('categories', 'readwrite'); t.objectStore('categories').clear(); t.oncomplete = res; });
+  await new Promise(res => { const t = db.transaction('imports', 'readwrite'); t.objectStore('imports').clear(); t.oncomplete = res; });
   localStorage.removeItem('installTipHidden');
   location.reload();
+}
+
+/* ================= CSV 导入 ================= */
+/* 兼容引号/换行的 CSV 解析，返回字符串二维数组 */
+function parseCSVText(text) {
+  text = text.replace(/^﻿/, '');
+  const rows = [];
+  let field = '', row = [], inQ = false;
+  const pushRow = () => { row.push(field); field = ''; rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      pushRow();
+    } else field += c;
+  }
+  if (field !== '' || row.length) pushRow();
+  return rows.filter(r => r.some(c => String(c).trim() !== ''));
+}
+
+/* 在表头里按候选名找列号 */
+function findColIdx(header, keys) {
+  const low = header.map(h => String(h).trim().toLowerCase());
+  for (const k of keys) {
+    const i = low.findIndex(h => h === k || h.includes(k));
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+/* 判断表头是否像一份可导入的账目 CSV（用于编码回退判断） */
+function looksLikeImportHeader(header) {
+  if (!header || !header.length) return false;
+  const low = header.map(h => String(h).trim().toLowerCase());
+  if (low.includes('账目编号')) return true;                       // Timi 导出
+  if (low[0] === '日期' && low.includes('金额(元)')) return true;   // Summa 备份
+  const hasAmt = findColIdx(header, ['金额']) !== -1;
+  const hasTime = findColIdx(header, ['时间', '日期']) !== -1;
+  const hasType = findColIdx(header, ['类型', '收支']) !== -1;
+  return hasAmt && hasTime && hasType;
+}
+
+/* 把不同来源的 CSV 行归一成 {type, cat, cents, date, tsMillis, note}，跳过无效行 */
+function normalizeImportRows(rows) {
+  const header = rows[0] || [];
+  let col;
+  const low0 = header.map(h => String(h).trim().toLowerCase());
+  if (low0.includes('账目编号')) {
+    // Timi 记账导出: 账目编号,类型,账目名称,金额,时间,备注,相关图片
+    col = { type: low0.indexOf('类型'), cat: low0.indexOf('账目名称'), amt: low0.indexOf('金额'), time: low0.indexOf('时间'), note: low0.indexOf('备注') };
+  } else if (low0[0] === '日期' && low0.includes('金额(元)')) {
+    // Summa 备份: 日期,类型,分类,金额(元),备注,账本,创建时间
+    col = { type: 1, cat: 2, amt: low0.indexOf('金额(元)'), time: 0, note: 4 };
+  } else {
+    // 通用表头模糊匹配
+    col = {
+      type: findColIdx(header, ['类型', '收支', '收入支出', '收/支']),
+      cat: findColIdx(header, ['账目名称', '分类', '类别', '类目']),
+      amt: findColIdx(header, ['金额']),
+      time: findColIdx(header, ['时间', '日期', '记账时间', '交易时间']),
+      note: findColIdx(header, ['备注', '摘要', '说明']),
+    };
+  }
+  if (col.amt === -1 || col.time === -1) return null;
+
+  const out = [];
+  for (const r of rows.slice(1)) {
+    const cell = i => (i >= 0 && i < r.length) ? String(r[i]).trim() : '';
+    let type = cell(col.type).toLowerCase();
+    type = (type === '支出' || type === 'expense' || type.startsWith('支')) ? 'expense'
+         : (type === '收入' || type === 'income' || type.startsWith('收')) ? 'income' : null;
+    let amtStr = cell(col.amt).replace(/[¥￥,\s"]/g, '').replace(/^\((.*)\)$/, '-$1');
+    let yuan = parseFloat(amtStr);
+    if (!isFinite(yuan) || yuan === 0) continue;
+    if (yuan < 0) { yuan = -yuan; if (!type) type = 'expense'; }
+    if (!type) continue;
+    const cents = Math.round(yuan * 100);
+    if (cents <= 0) continue;
+    // 日期：支持 YYYY-MM-DD HH:MM:SS、YYYY/M/D、YYYY.M.D、YYYY年M月D日 等
+    const tstr = cell(col.time);
+    const m = tstr.match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
+    if (!m) continue;
+    const date = `${m[1]}-${pad2(Number(m[2]))}-${pad2(Number(m[3]))}`;
+    let tsMillis = Date.parse(tstr.replace(/年|月/g, '-').replace(/日/g, '')) || Date.parse(date);
+    if (!isFinite(tsMillis)) tsMillis = Date.now();
+    out.push({ type, cat: cell(col.cat) || '其他', cents, date, tsMillis, note: cell(col.note) });
+  }
+  return out;
+}
+
+async function runImport(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    let text = new TextDecoder('utf-8').decode(buf);
+    if (!looksLikeImportHeader(parseCSVText(text)[0])) {
+      const alt = new TextDecoder('gb18030').decode(buf); // Timi GBK 导出
+      if (looksLikeImportHeader(parseCSVText(alt)[0])) text = alt;
+    }
+    const recs = normalizeImportRows(parseCSVText(text));
+    if (!recs) { toast('无法识别 CSV 列格式，请使用 Summa 备份或 Timi 导出文件'); return; }
+
+    // 与本机已有流水按 日期|类型|分类|金额|备注 判重（重复导入同一文件时全部判重，不新增）
+    const existing = await getAll('transactions');
+    const existKeys = new Set(existing.map(t => {
+      const c = catById(t.categoryId);
+      return `${t.date}|${t.type}|${c ? c.name : ''}|${t.amount}|${t.note || ''}`;
+    }));
+
+    // 分类：按 名称+类型 匹配，缺了就自动建
+    await reloadCats();
+    const catIds = {};
+    state.cats.forEach(c => catIds[c.type + '|' + c.name] = c.id);
+    const newCatNames = [];
+    const maxSort = state.cats.reduce((m, c) => Math.max(m, c.sort), -1);
+    let sort = maxSort;
+    for (const r of recs) {
+      const key = r.type + '|' + r.cat;
+      if (catIds[key] === undefined) {
+        sort++;
+        const obj = {
+          name: r.cat, type: r.type, sort, builtin: false, ledgerId: 1,
+          emoji: EMOJI_CHOICES[sort % EMOJI_CHOICES.length],
+          color: COLOR_CHOICES[sort % COLOR_CHOICES.length],
+          createdAt: Date.now(), updatedAt: Date.now(),
+        };
+        catIds[key] = await put('categories', obj);
+        newCatNames.push(r.cat);
+      }
+    }
+    if (newCatNames.length) await reloadCats();
+
+    const now = Date.now();
+    const newTxs = [];
+    let dup = 0;
+    recs.forEach((r, i) => {
+      const k = `${r.date}|${r.type}|${r.cat}|${r.cents}|${r.note}`;
+      if (existKeys.has(k)) { dup++; return; } // 只与本机已有流水判重，保证重复导入幂等；批次内部同键记录各自保留
+      newTxs.push({
+        amount: r.cents, type: r.type, categoryId: catIds[r.type + '|' + r.cat],
+        note: r.note, date: r.date, ledgerId: 1, importId: 0,
+        createdAt: r.tsMillis || (now + i), updatedAt: now,
+      });
+    });
+    if (!newTxs.length) { toast(dup ? `没有新数据：${dup} 条全部重复` : '没有可导入的有效记录'); return; }
+
+    const db = await openDB();
+    const batch = {
+      time: now, file: file.name, count: newTxs.length, dup,
+      expense: newTxs.filter(t => t.type === 'expense').length,
+      income: newTxs.filter(t => t.type === 'income').length,
+      newCats: newCatNames,
+    };
+    const importId = await put('imports', batch);
+    await new Promise((res, rej) => {
+      const tx = db.transaction('transactions', 'readwrite');
+      const st = tx.objectStore('transactions');
+      newTxs.forEach(t => st.add({ ...t, importId }));
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+    await render();
+    toast(`导入完成：新增 ${newTxs.length} 条，新建分类 ${newCatNames.length} 个，跳过重复 ${dup} 条`);
+  } catch (e) {
+    console.error(e);
+    toast('导入失败：' + (e && e.message ? e.message : e));
+  }
+}
+
+/* ---------- 导入历史 ---------- */
+async function renderImportHistory() {
+  const wrap = $('#importHistoryWrap');
+  if (!wrap) return;
+  const list = (await getAll('imports')).sort((a, b) => b.time - a.time);
+  if (!list.length) { wrap.innerHTML = ''; return; }
+  let html = `<div class="card" style="margin-bottom:12px">
+    <div class="set-row"><span>导入历史<span class="sub">共 ${list.length} 次 · 撤销会删除该批次导入的流水，新建的分类保留</span></span></div>`;
+  for (const b of list) {
+    html += `<div class="set-row"><span>${esc(b.file)}<span class="sub">${new Date(b.time).toLocaleString('zh-CN', { hour12: false })} · 新增 ${b.count} 条（支出 ${b.expense} / 收入 ${b.income}）${b.newCats && b.newCats.length ? ' · 新分类：' + esc(b.newCats.join('、')) : ''}${b.dup ? ` · 跳过重复 ${b.dup}` : ''}</span></span><button class="danger" data-undo="${b.id}">撤销</button></div>`;
+  }
+  html += '</div>';
+  wrap.innerHTML = html;
+  wrap.querySelectorAll('[data-undo]').forEach(btn => btn.onclick = () => undoImport(Number(btn.dataset.undo)));
+}
+
+async function undoImport(id) {
+  if (!confirm('撤销这次导入？该批次新增的所有流水将被删除（新建的分类会保留）。')) return;
+  const all = await getAll('transactions');
+  const victims = all.filter(t => t.importId === id);
+  const db = await openDB();
+  await new Promise((res, rej) => {
+    const tx = db.transaction('transactions', 'readwrite');
+    const st = tx.objectStore('transactions');
+    victims.forEach(t => st.delete(t.id));
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
+  await del('imports', id);
+  await render();
+  toast(`已撤销导入，删除 ${victims.length} 条流水`);
 }
 
 /* ================= 记账弹层 ================= */
